@@ -1,5 +1,5 @@
 import gzip
-from typing import Dict, Union, List
+from typing import Dict, Union, List, Generator
 import warnings
 from contextlib import suppress
 
@@ -94,8 +94,18 @@ class Classification:
             for layer in range(self.layers)
         ]
 
+    def _sequence_stream(self, sequences_fname: str):
+        """Yield (header, sequence) tuples for each sequence in file above min_len."""
+        ParseFunc = SimpleFastaParser
+        opener = gzip.open if sequences_fname.endswith(".gz") else open
+        mode = "rt" if sequences_fname.endswith(".gz") else "r"
+        with opener(sequences_fname, mode) as sequences_handle:
+            for header, seq in ParseFunc(sequences_handle):
+                if len(seq) >= self.min_len:
+                    yield (header, seq)
+
     def classify(self, sequences_fname: str, verbose=False) -> List[SingleResult]:
-        """Perform a two-step classification.
+        """Perform a two-step classification (streamed, low memory).
 
         Parameters
         ----------
@@ -105,96 +115,48 @@ class Classification:
         -------
             predictions: a list of lists containing SingleResult objects.
         """
-        if sequences_fname.endswith(".gz"):
-            with gzip.open(sequences_fname, "rt") as sequences_handle:
-                seqs = list(SimpleFastaParser(sequences_handle))
-        else:
-            with open(sequences_fname, "r") as sequences_handle:
-                seqs = list(SimpleFastaParser(sequences_handle))
-        seqs = [x for x in seqs if len(x[1]) >= self.min_len]
-
-        do = delayed(fun)
-        executor = Parallel(n_jobs=self.threads)
-        tasks = (
-            do(x[1], 0, self.predictors[0].transformer, self.params[0]["fragment_len"])
-            for x in seqs
-        )
-        cont_manager = (
-            time_context_manager("Calculating first stage sequence representations")
-            if verbose
-            else suppress()
-        )
-        with cont_manager:
-            seqs = list(
-                zip([x[0] for x in seqs], [x[1] for x in seqs], executor(tasks))
-            )
-
-        # Two-step classification
+        # For progress bar, count sequences if verbose
         if verbose:
-            print("Performing first stage of classification.")
-            fst_stage_results = []
-            for seq in tqdm(seqs):
-                fst_stage_results.append(self.predictors[0].make_prediction(seq))
+            with (gzip.open(sequences_fname, "rt") if sequences_fname.endswith(".gz") else open(sequences_fname, "r")) as handle:
+                n_seqs = sum(1 for line in handle if line.startswith(">"))
+            seq_iter = self._sequence_stream(sequences_fname)
+            seq_iter = tqdm(seq_iter, total=n_seqs, desc="Classifying")
         else:
-            # tasks = (do(seq) for seq in seqs)
-            # fst_stage_results = executor(tasks)
-            fst_stage_results = [
-                self.predictors[0].make_prediction(seq) for seq in seqs
-            ]
-        if verbose:
-            print("Done")
+            seq_iter = self._sequence_stream(sequences_fname)
+
         predictions = []
         to_second_stage = []
-        for prediction in fst_stage_results:
-            if prediction.cls[0] == "organelle":
-                to_second_stage.append(prediction)
+        for header, seq in seq_iter:
+            # First stage: feature extraction and classification
+            features = fun(seq, 0, self.predictors[0].transformer, self.params[0]["fragment_len"])
+            seq_item = (header, seq, features)
+            pred1 = self.predictors[0].make_prediction(seq_item)
+            if pred1.cls[0] == "organelle":
+                to_second_stage.append(pred1)
             else:
-                predictions.append(prediction)
+                predictions.append(pred1)
+
+        # Stream second stage for organellar sequences
         if to_second_stage:
-            tasks = (
-                do(
-                    record.seq,
-                    1,
-                    self.predictors[1].transformer,
-                    self.params[1]["fragment_len"],
-                )
-                for record in to_second_stage
-            )
-            cont_manager = (
-                time_context_manager(
-                    "Calculating second stage sequence representations"
-                )
-                if verbose
-                else suppress()
-            )
-            with cont_manager:
-                seqs2 = list(
-                    zip(
-                        [record.desc for record in to_second_stage],
-                        [record.seq for record in to_second_stage],
-                        executor(tasks),
-                    )
-                )
             if verbose:
                 print("Performing second stage of classification.")
-                snd_stage_results = []
-                for seq in tqdm(seqs2):
-                    snd_stage_results.append(self.predictors[1].make_prediction(seq))
+                seq_iter2 = tqdm(to_second_stage, desc="Second stage")
             else:
-                # tasks = (do_second_stage(seq) for seq in seqs2)
-                # snd_stage_results = executor(tasks)
-                snd_stage_results = [
-                    self.predictors[1].make_prediction(seq) for seq in seqs2
-                ]
-            for fst, snd in zip(to_second_stage, snd_stage_results):
-                assert fst.desc == snd.desc, "Descriptions not the same"
-                assert fst.seq == snd.seq, "Sequences not the same"
+                seq_iter2 = to_second_stage
+            for record in seq_iter2:
+                features2 = fun(
+                    record.seq, 1, self.predictors[1].transformer, self.params[1]["fragment_len"]
+                )
+                seq_item2 = (record.desc, record.seq, features2)
+                pred2 = self.predictors[1].make_prediction(seq_item2)
+                assert record.desc == pred2.desc, "Descriptions not the same"
+                assert record.seq == pred2.seq, "Sequences not the same"
                 predictions.append(
                     SingleResult(
-                        desc=fst.desc,
-                        seq=fst.seq,
-                        cls=[fst.cls[0], snd.cls[1]],
-                        probs=[fst.probs[0], snd.probs[1]],
+                        desc=record.desc,
+                        seq=record.seq,
+                        cls=[record.cls[0], pred2.cls[1]],
+                        probs=[record.probs[0], pred2.probs[1]],
                     )
                 )
         return predictions
